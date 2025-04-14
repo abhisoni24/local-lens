@@ -1,2 +1,6 @@
 lens
 .env
+img
+.vscode
+analysis_results
+responses.txt

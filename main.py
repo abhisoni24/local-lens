@@ -7,9 +7,10 @@ from datetime import datetime
 from PyQt6.QtWidgets import (QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout, 
                             QPushButton, QTextEdit, QLabel, QLineEdit, QSplitter, 
                             QFrame, QMessageBox, QFileDialog)
-from PyQt6.QtCore import Qt, QTimer, pyqtSlot, QSize
+from PyQt6.QtCore import Qt, QTimer, pyqtSlot, QSize, QEvent
 from PyQt6.QtGui import QImage, QPixmap, QFont, QIcon
 import openai
+from openai import OpenAI
 import threading
 import json
 import io
@@ -18,13 +19,21 @@ from dotenv import load_dotenv
 class ImageAnalysisApp(QMainWindow):
     def __init__(self):
         super().__init__()
+        #Load tenvironment variables
+        load_dotenv()
+        self.api_key = os.getenv("OPENAI_API_KEY")
+        # print(self.api_key)
+        if not self.api_key:
+            QMessageBox.critical(self,"API Key Error", "No API key found in the secret file,")
+            sys.exit(1) 
+
         # Initialize UI properties
-        self.setWindowTitle("AI Image Analysis")
+        self.setWindowTitle("Local Lens v1")
         self.setMinimumSize(1000, 700)
         
         # OpenAI API configuration
         self.api_key = "OPENAI_API_KEY"
-        self.default_prompt = "Describe what you see in this image in detail."
+        self.default_prompt = "Answer the question asked in the image"
         self.setup_ui()
         
         # Initialize camera
@@ -47,7 +56,7 @@ class ImageAnalysisApp(QMainWindow):
         main_layout.setSpacing(15)
         
         # Title
-        title_label = QLabel("AI Image Analysis")
+        title_label = QLabel("Local Lens")
         title_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
         title_label.setFont(QFont("Arial", 18, QFont.Weight.Bold))
         main_layout.addWidget(title_label)
@@ -64,7 +73,7 @@ class ImageAnalysisApp(QMainWindow):
         self.camera_label = QLabel()
         self.camera_label.setMinimumSize(480, 360)
         self.camera_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        self.camera_label.setStyleSheet("border: 2px solid #cccccc; border-radius: 5px; background-color: #f0f0f0;")
+        self.camera_label.setStyleSheet("border: 2px solid #cccccc; border-radius: 5px; background-color: #000000;")
         left_layout.addWidget(self.camera_label)
         
         # Camera controls
@@ -153,7 +162,7 @@ class ImageAnalysisApp(QMainWindow):
                 border: 1px solid #cccccc;
                 border-radius: 5px;
                 padding: 10px;
-                background-color: #f9f9f9;
+                background-color: #000000;
                 font-size: 11pt;
             }
         """)
@@ -252,13 +261,30 @@ class ImageAnalysisApp(QMainWindow):
         if self.frame is not None:
             self.captured_image = self.frame.copy()
             
+            # Create 'img' folder if it doesn't exist
+            img_dir = "img"
+            if not os.path.exists(img_dir):
+                os.makedirs(img_dir)
+            
+            # Generate a sequential filename
+            existing_files = [f for f in os.listdir(img_dir) if f.endswith(".jpg")]
+            next_index = len(existing_files) + 1
+            image_filename = f"image_{next_index:03d}.jpg"
+            image_path = os.path.join(img_dir, image_filename)
+            
+            # Save the image
+            cv2.imwrite(image_path, self.captured_image)
+            
+            # Store the path in curr_image
+            self.curr_image = image_path
+            
             # Update UI to show captured image
             frame_rgb = cv2.cvtColor(self.captured_image, cv2.COLOR_BGR2RGB)
             h, w, ch = frame_rgb.shape
             img = QImage(frame_rgb.data, w, h, ch * w, QImage.Format.Format_RGB888)
             pixmap = QPixmap.fromImage(img)
             pixmap = pixmap.scaled(self.camera_label.width(), self.camera_label.height(), 
-                                  Qt.AspectRatioMode.KeepAspectRatio)
+                                Qt.AspectRatioMode.KeepAspectRatio)
             self.camera_label.setPixmap(pixmap)
             
             # Update button states
@@ -269,9 +295,9 @@ class ImageAnalysisApp(QMainWindow):
             # Pause camera updates
             self.timer.stop()
             
-            self.status_label.setText("Image captured! Ready for analysis.")
+            self.status_label.setText(f"Image captured and saved as {image_filename}! Ready for analysis.")
             self.status_label.setStyleSheet("color: #4CAF50; font-weight: bold;")
-    
+            
     def reset_capture(self):
         # Clear captured image
         self.captured_image = None
@@ -290,7 +316,8 @@ class ImageAnalysisApp(QMainWindow):
     
     def analyze_image(self):
         # Check if API key is provided
-        self.api_key = self.api_input.text().strip()
+        if not self.api_key:
+            self.api_key = self.api_input.text().strip()
         if not self.api_key:
             QMessageBox.warning(self, "API Key Required", "Please enter your OpenAI API key.")
             return
@@ -313,44 +340,79 @@ class ImageAnalysisApp(QMainWindow):
         # Run analysis in a separate thread to avoid UI freezing
         threading.Thread(target=self._run_analysis, args=(prompt,), daemon=True).start()
     
+    #function to encode the image
+
+    def encode_image(self,image_path):
+        with open(image_path, "rb") as image_file:
+            return base64.b64encode(image_file.read()).decode("utf-8")
+    
     def _run_analysis(self, prompt):
         try:
-            # Convert image to base64
-            _, buffer = cv2.imencode('.jpg', self.captured_image)
-            encoded_image = base64.b64encode(buffer).decode('utf-8')
-            
-            # Set up OpenAI client
-            openai.api_key = self.api_key
-            
-            # Prepare the request
-            response = openai.chat.completions.create(
-                model="gpt-4-vision-preview",  # Using GPT-4 Vision model
-                messages=[
+            client = OpenAI()
+            image_path = self.curr_image
+            base64_image = self.encode_image(image_path)
+
+            response = client.responses.create(
+                model="gpt-4o",
+                input=[
                     {
                         "role": "user",
                         "content": [
-                            {"type": "text", "text": prompt},
+                            { "type": "input_text", "text": "If this image is a quiz question, answer it. Otherwise, explain the image." },
                             {
-                                "type": "image_url",
-                                "image_url": {
-                                    "url": f"data:image/jpeg;base64,{encoded_image}"
-                                }
-                            }
-                        ]
+                                "type": "input_image",
+                                "image_url": f"data:image/jpeg;base64,{base64_image}",
+                            },
+                        ],
                     }
                 ],
-                max_tokens=1000
             )
+
+            
+
+            # # Convert image to base64
+            # _, buffer = cv2.imencode('.jpg', self.captured_image)
+            # encoded_image = base64.b64encode(buffer).decode('utf-8')
+            
+            # # Set up OpenAI client
+            # openai.api_key = self.api_key
+            
+            # # Prepare the request
+            # response = openai.chat.completions.create(
+            #     model="gpt-4-vision-preview",  # Using GPT-4 Vision model
+            #     messages=[
+            #         {
+            #             "role": "user",
+            #             "content": [
+            #                 {"type": "text", "text": prompt},
+            #                 {
+            #                     "type": "image_url",
+            #                     "image_url": {
+            #                         "url": f"data:image/jpeg;base64,{encoded_image}"
+            #                     }
+            #                 }
+            #             ]
+            #         }
+            #     ],
+            #     max_tokens=1000
+            # )
             
             # Extract the response text
-            response_text = response.choices[0].message.content
-            
+            # print(response)
+            response_text = response.output_text
+            # Append response to responses.txt
+            timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+            with open("responses.txt", "a") as file:
+                file.write(f"{timestamp} - {response_text}\n \n \n")
+
             # Update UI in the main thread
             QApplication.instance().postEvent(self, ResultEvent(response_text))
+
             
         except Exception as e:
             # Handle errors
             error_message = f"Error: {str(e)}"
+            print(error_message)
             QApplication.instance().postEvent(self, ErrorEvent(error_message))
     
     def handle_result(self, result_text):
@@ -423,26 +485,20 @@ class ImageAnalysisApp(QMainWindow):
 
 
 # Custom event for thread communication
-class ResultEvent(QApplication.instance().Event):
-    EVENT_TYPE = QApplication.instance().registerEventType()
+class ResultEvent(QEvent):
+    EVENT_TYPE = QEvent.Type(QEvent.registerEventType())
     
     def __init__(self, result_text):
         super().__init__(self.EVENT_TYPE)
         self.result_text = result_text
-        
-    def type(self):
-        return self.EVENT_TYPE
 
 
-class ErrorEvent(QApplication.instance().Event):
-    EVENT_TYPE = QApplication.instance().registerEventType()
+class ErrorEvent(QEvent):
+    EVENT_TYPE = QEvent.Type(QEvent.registerEventType())
     
     def __init__(self, error_message):
         super().__init__(self.EVENT_TYPE)
         self.error_message = error_message
-        
-    def type(self):
-        return self.EVENT_TYPE
 
 
 # Override event method to handle custom events
@@ -465,19 +521,33 @@ if __name__ == "__main__":
     
     # Set application-wide stylesheet
     app.setStyleSheet("""
-        QMainWindow {
-            background-color: #f5f5f5;
-        }
-        QLabel {
-            font-size: 10pt;
-        }
-        QTextEdit, QLineEdit {
-            font-size: 10pt;
-        }
-        QPushButton {
-            font-size: 10pt;
-        }
-    """)
+    QMainWindow {
+        background-color: #000000;  /* Set background color to black */
+    }
+    QLabel {
+        font-size: 10pt;
+        color: #ffffff;  /* Set text color to white for visibility */
+    }
+    QTextEdit, QLineEdit {
+        font-size: 10pt;
+        color: #ffffff;  /* Set text color to white for visibility */
+        background-color: #333333;  /* Set input background to dark gray */
+        border: 1px solid #555555;
+    }
+    QPushButton {
+        font-size: 10pt;
+        color: #ffffff;  /* Set button text color to white */
+        background-color: #444444;  /* Set button background to dark gray */
+        border: 1px solid #666666;
+    }
+    QPushButton:hover {
+        background-color: #555555;  /* Slightly lighter gray on hover */
+    }
+    QPushButton:disabled {
+        background-color: #222222;  /* Darker gray for disabled buttons */
+        color: #777777;
+    }
+""")
     
     window = ImageAnalysisApp()
     window.show()

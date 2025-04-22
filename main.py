@@ -1,19 +1,16 @@
 import sys
 import cv2
 import base64
-import time
 import os
 from datetime import datetime
 from PyQt6.QtWidgets import (QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout, 
                             QPushButton, QTextEdit, QLabel, QLineEdit, QSplitter, 
-                            QFrame, QMessageBox, QFileDialog)
-from PyQt6.QtCore import Qt, QTimer, pyqtSlot, QSize, QEvent
-from PyQt6.QtGui import QImage, QPixmap, QFont, QIcon
-import openai
+                            QMessageBox)
+from PyQt6.QtCore import Qt, QTimer, QEvent
+from PyQt6.QtGui import QImage, QPixmap, QFont
 from openai import OpenAI
 import threading
 import json
-import io
 from dotenv import load_dotenv
 
 class ImageAnalysisApp(QMainWindow):
@@ -22,18 +19,18 @@ class ImageAnalysisApp(QMainWindow):
         #Load tenvironment variables
         load_dotenv()
         self.api_key = os.getenv("OPENAI_API_KEY")
-        # print(self.api_key)
-        if not self.api_key:
-            QMessageBox.critical(self,"API Key Error", "No API key found in the secret file,")
-            sys.exit(1) 
+
+        # if not self.api_key:
+        #     QMessageBox.critical(self,"API Key Error", "No API key found in the secret file,")
+        #     sys.exit(1) 
 
         # Initialize UI properties
-        self.setWindowTitle("Local Lens v1")
+        self.setWindowTitle("Local Lens v1.2")
         self.setMinimumSize(1000, 700)
         
         # OpenAI API configuration
         self.api_key = "OPENAI_API_KEY"
-        self.default_prompt = "Answer the question asked in the image"
+        self.default_prompt = "Analyze the provided image. If it is a quiz question, answer it. Otherwise, explain what you see in the picture."
         self.setup_ui()
         
         # Initialize camera
@@ -56,7 +53,7 @@ class ImageAnalysisApp(QMainWindow):
         main_layout.setSpacing(15)
         
         # Title
-        title_label = QLabel("Local Lens")
+        title_label = QLabel("Local Lens v1.2")
         title_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
         title_label.setFont(QFont("Arial", 18, QFont.Weight.Bold))
         main_layout.addWidget(title_label)
@@ -232,11 +229,20 @@ class ImageAnalysisApp(QMainWindow):
         main_layout.addWidget(splitter)
         
     def start_camera(self):
-        self.camera = cv2.VideoCapture(self.camera_id)
-        if not self.camera.isOpened():
-            QMessageBox.critical(self, "Camera Error", "Could not open camera. Please check your camera connection.")
+        # Try to open the plugged-in camera first
+        self.camera = cv2.VideoCapture(1)
+        if self.camera.isOpened():
+            self.camera_id = 1
+        else:
+            for cam in range(0,5):  # Check up to 5 camera indices
+                self.camera = cv2.VideoCapture(cam)
+                if self.camera.isOpened():
+                    self.camera_id = cam
+                    break
+        if self.camera_id not in [0,1,2,3,4,5]:
+            QMessageBox.critical(self, "Camera Error", "No camera found. Please check your camera connection.")
             return
-            
+
         self.timer.start(30)  # Update every 30ms (33 fps)
         
     def update_frame(self):
@@ -310,7 +316,11 @@ class ImageAnalysisApp(QMainWindow):
         # Restart camera updates
         if not self.timer.isActive():
             self.timer.start(30)
-            
+        
+        # Clear the response_text field
+        self.response_text.clear()
+        
+        # Update status label
         self.status_label.setText("Ready")
         self.status_label.setStyleSheet("color: #666666; font-style: italic;")
     
@@ -327,18 +337,21 @@ class ImageAnalysisApp(QMainWindow):
             QMessageBox.warning(self, "No Image", "Please capture an image first.")
             return
             
-        # Get prompt
-        prompt = self.prompt_input.toPlainText().strip()
-        if not prompt:
-            prompt = self.default_prompt
-            
         # Update UI
         self.analyze_btn.setEnabled(False)
         self.status_label.setText("Analyzing image...")
         self.status_label.setStyleSheet("color: #2196F3; font-weight: bold;")
         
         # Run analysis in a separate thread to avoid UI freezing
-        threading.Thread(target=self._run_analysis, args=(prompt,), daemon=True).start()
+        prompt = self.generate_prompt()
+        threading.Thread(target=self._run_analysis, args=(self.generate_prompt(),), daemon=True).start()
+
+    def generate_prompt(self):
+        # Get prompt
+        prompt = self.prompt_input.toPlainText().strip()
+        if not prompt:
+            prompt = self.default_prompt
+        return prompt
     
     #function to encode the image
 
@@ -351,6 +364,7 @@ class ImageAnalysisApp(QMainWindow):
             client = OpenAI()
             image_path = self.curr_image
             base64_image = self.encode_image(image_path)
+            final_prompt = self.generate_prompt()
 
             response = client.responses.create(
                 model="gpt-4o",
@@ -358,7 +372,7 @@ class ImageAnalysisApp(QMainWindow):
                     {
                         "role": "user",
                         "content": [
-                            { "type": "input_text", "text": "If this image is a quiz question, answer it. Otherwise, explain the image." },
+                            { "type": "input_text", "text": f"Hello. {final_prompt}"},
                             {
                                 "type": "input_image",
                                 "image_url": f"data:image/jpeg;base64,{base64_image}",
@@ -367,43 +381,11 @@ class ImageAnalysisApp(QMainWindow):
                     }
                 ],
             )
-
-            
-
-            # # Convert image to base64
-            # _, buffer = cv2.imencode('.jpg', self.captured_image)
-            # encoded_image = base64.b64encode(buffer).decode('utf-8')
-            
-            # # Set up OpenAI client
-            # openai.api_key = self.api_key
-            
-            # # Prepare the request
-            # response = openai.chat.completions.create(
-            #     model="gpt-4-vision-preview",  # Using GPT-4 Vision model
-            #     messages=[
-            #         {
-            #             "role": "user",
-            #             "content": [
-            #                 {"type": "text", "text": prompt},
-            #                 {
-            #                     "type": "image_url",
-            #                     "image_url": {
-            #                         "url": f"data:image/jpeg;base64,{encoded_image}"
-            #                     }
-            #                 }
-            #             ]
-            #         }
-            #     ],
-            #     max_tokens=1000
-            # )
-            
-            # Extract the response text
-            # print(response)
             response_text = response.output_text
             # Append response to responses.txt
             timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
             with open("responses.txt", "a") as file:
-                file.write(f"{timestamp} - {response_text}\n \n \n")
+                file.write(f"\n {timestamp} - {response_text}\n \n \n")
 
             # Update UI in the main thread
             QApplication.instance().postEvent(self, ResultEvent(response_text))
@@ -449,7 +431,7 @@ class ImageAnalysisApp(QMainWindow):
             # Save the analysis text
             text_path = os.path.join(results_dir, f"analysis_{timestamp}.txt")
             with open(text_path, 'w') as f:
-                f.write(f"Prompt: {self.prompt_input.toPlainText()}\n\n")
+                f.write(f" \n Prompt: {self.prompt_input.toPlainText()}\n\n")
                 f.write(f"Analysis:\n{self.response_text.toPlainText()}")
                 
             # Save a JSON file with all information

@@ -53,7 +53,7 @@ class ImageAnalysisApp(QMainWindow):
         main_layout.setSpacing(15)
         
         # Title
-        title_label = QLabel("Local Lens v1.2")
+        title_label = QLabel("Welcome to Local Lens")
         title_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
         title_label.setFont(QFont("Arial", 18, QFont.Weight.Bold))
         main_layout.addWidget(title_label)

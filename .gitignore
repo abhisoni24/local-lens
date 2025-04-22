@@ -4,3 +4,6 @@ img
 .vscode
 analysis_results
 responses.txt
+build
+dist
+lens.exe

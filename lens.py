@@ -1,17 +1,40 @@
 import sys
 import cv2
 import base64
-import os
+import os  # Add explicit os import
 from datetime import datetime
 from PyQt6.QtWidgets import (QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout, 
                             QPushButton, QTextEdit, QLabel, QLineEdit, QSplitter, 
                             QMessageBox)
 from PyQt6.QtCore import Qt, QTimer, QEvent
-from PyQt6.QtGui import QImage, QPixmap, QFont
+from PyQt6.QtGui import QImage, QPixmap, QFont, QTextCharFormat  # Add QTextCharFormat for chat formatting
 from openai import OpenAI
 import threading
 import json
 from dotenv import load_dotenv
+
+# Custom event for thread communication
+class ResultEvent(QEvent):
+    EVENT_TYPE = QEvent.Type(QEvent.registerEventType())
+    
+    def __init__(self, result_text):
+        super().__init__(self.EVENT_TYPE)
+        self.result_text = result_text
+
+class ErrorEvent(QEvent):
+    EVENT_TYPE = QEvent.Type(QEvent.registerEventType())
+    
+    def __init__(self, error_message):
+        super().__init__(self.EVENT_TYPE)
+        self.error_message = error_message
+
+# Add ChatResponseEvent class
+class ChatResponseEvent(QEvent):
+    EVENT_TYPE = QEvent.Type(QEvent.registerEventType())
+    
+    def __init__(self, response_text):
+        super().__init__(self.EVENT_TYPE)
+        self.response_text = response_text
 
 class ImageAnalysisApp(QMainWindow):
     def __init__(self):
@@ -25,19 +48,24 @@ class ImageAnalysisApp(QMainWindow):
         #     sys.exit(1) 
 
         # Initialize UI properties
-        self.setWindowTitle("Local Lens v1.2")
+        self.setWindowTitle("Local Lens v1.3")
         self.setMinimumSize(1000, 700)
         
         # OpenAI API configuration
         self.api_key = "OPENAI_API_KEY"
         self.default_prompt = "Analyze the provided image. If it is a quiz question, answer it. Otherwise, explain what you see in the picture."
+        
+        # Initialize chat history
+        self.chat_history = []
+        
         self.setup_ui()
         
         # Initialize camera
         self.camera = None
-        self.camera_id = 0
+        self.camera_id = None  # Initialize as None instead of 0
         self.frame = None
         self.captured_image = None
+        self.curr_image = None  # Make sure this is initialized
         self.timer = QTimer()
         self.timer.timeout.connect(self.update_frame)
         
@@ -143,18 +171,19 @@ class ImageAnalysisApp(QMainWindow):
         api_layout.addWidget(self.api_input)
         left_layout.addLayout(api_layout)
         
-        # Right panel (AI response)
+        # Right panel (Chat interface)
         right_panel = QWidget()
         right_layout = QVBoxLayout(right_panel)
         right_layout.setContentsMargins(10, 0, 0, 0)
         
-        response_label = QLabel("AI Response:")
-        response_label.setFont(QFont("Arial", 10, QFont.Weight.Bold))
-        right_layout.addWidget(response_label)
+        chat_label = QLabel("Chat with AI:")
+        chat_label.setFont(QFont("Arial", 10, QFont.Weight.Bold))
+        right_layout.addWidget(chat_label)
         
-        self.response_text = QTextEdit()
-        self.response_text.setReadOnly(True)
-        self.response_text.setStyleSheet("""
+        # Chat display area
+        self.chat_display = QTextEdit()
+        self.chat_display.setReadOnly(True)
+        self.chat_display.setStyleSheet("""
             QTextEdit {
                 border: 1px solid #cccccc;
                 border-radius: 5px;
@@ -163,7 +192,47 @@ class ImageAnalysisApp(QMainWindow):
                 font-size: 11pt;
             }
         """)
-        right_layout.addWidget(self.response_text)
+        right_layout.addWidget(self.chat_display, 1)  # Give it stretch factor of 1
+        
+        # Chat input area
+        chat_input_layout = QHBoxLayout()
+        
+        self.message_input = QTextEdit()
+        self.message_input.setPlaceholderText("Type your message here...")
+        self.message_input.setMaximumHeight(70)
+        self.message_input.setStyleSheet("""
+            QTextEdit {
+                border: 1px solid #cccccc;
+                border-radius: 5px;
+                padding: 5px;
+                background-color: #333333;
+                font-size: 11pt;
+            }
+        """)
+        
+        # Make Enter key send the message
+        self.message_input.installEventFilter(self)
+        
+        self.send_btn = QPushButton("Send")
+        self.send_btn.setMinimumHeight(40)
+        self.send_btn.clicked.connect(self.send_message)
+        self.send_btn.setStyleSheet("""
+            QPushButton {
+                background-color: #2196F3;
+                color: white;
+                border-radius: 5px;
+                font-weight: bold;
+                padding: 5px 15px;
+            }
+            QPushButton:hover {
+                background-color: #0b7dda;
+            }
+        """)
+        
+        chat_input_layout.addWidget(self.message_input, 1)
+        chat_input_layout.addWidget(self.send_btn)
+        
+        right_layout.addLayout(chat_input_layout)
         
         # Analysis button
         self.analyze_btn = QPushButton("Analyze Image")
@@ -221,47 +290,64 @@ class ImageAnalysisApp(QMainWindow):
         # Add panels to splitter
         splitter.addWidget(left_panel)
         splitter.addWidget(right_panel)
-        
-        # Set initial splitter sizes
+          # Set initial splitter sizes
         splitter.setSizes([500, 500])
-        
-        # Add splitter to main layout
+          # Add splitter to main layout
         main_layout.addWidget(splitter)
         
     def start_camera(self):
         # Try to open the plugged-in camera first
-        self.camera = cv2.VideoCapture(1)
-        if self.camera.isOpened():
-            self.camera_id = 1
-        else:
-            for cam in range(0,5):  # Check up to 5 camera indices
-                self.camera = cv2.VideoCapture(cam)
-                if self.camera.isOpened():
-                    self.camera_id = cam
-                    break
-        if self.camera_id not in [0,1,2,3,4,5]:
-            QMessageBox.critical(self, "Camera Error", "No camera found. Please check your camera connection.")
-            return
-
-        self.timer.start(30)  # Update every 30ms (33 fps)
+        try:
+            self.camera = cv2.VideoCapture(1)
+            if self.camera.isOpened():
+                self.camera_id = 1
+            else:
+                # Try to find any working camera
+                for cam in range(0, 5):  # Check up to 5 camera indices
+                    try:
+                        self.camera = cv2.VideoCapture(cam)
+                        if self.camera.isOpened():
+                            self.camera_id = cam
+                            break
+                    except Exception as e:
+                        print(f"Error trying camera index {cam}: {str(e)}")
+        
+            # Check if we found a working camera
+            if self.camera_id is None or not self.camera.isOpened():
+                QMessageBox.critical(self, "Camera Error", "No camera found. Please check your camera connection.")
+                self.status_label.setText("No camera detected - image analysis only")
+                self.status_label.setStyleSheet("color: #f44336; font-weight: bold;")
+                return
+            
+            self.timer.start(30)  # Update every 30ms (33 fps)
+        except Exception as e:
+            print(f"Camera initialization error: {str(e)}")
+            QMessageBox.critical(self, "Camera Error", f"Error initializing camera: {str(e)}")
+            self.status_label.setText("Camera error - image analysis only")
+            self.status_label.setStyleSheet("color: #f44336; font-weight: bold;")
         
     def update_frame(self):
+        if self.camera is None or not self.camera.isOpened():
+            return
+            
         ret, self.frame = self.camera.read()
-        if ret:
-            # Convert frame to RGB format
-            frame_rgb = cv2.cvtColor(self.frame, cv2.COLOR_BGR2RGB)
-            h, w, ch = frame_rgb.shape
+        if not ret:
+            return
             
-            # Convert to QImage and then to QPixmap
-            img = QImage(frame_rgb.data, w, h, ch * w, QImage.Format.Format_RGB888)
-            pixmap = QPixmap.fromImage(img)
-            
-            # Scale pixmap to fit the label while maintaining aspect ratio
-            pixmap = pixmap.scaled(self.camera_label.width(), self.camera_label.height(), 
-                                   Qt.AspectRatioMode.KeepAspectRatio)
-            
-            # Display the frame
-            self.camera_label.setPixmap(pixmap)
+        # Convert frame to RGB format
+        frame_rgb = cv2.cvtColor(self.frame, cv2.COLOR_BGR2RGB)
+        h, w, ch = frame_rgb.shape
+        
+        # Convert to QImage and then to QPixmap
+        img = QImage(frame_rgb.data, w, h, ch * w, QImage.Format.Format_RGB888)
+        pixmap = QPixmap.fromImage(img)
+        
+        # Scale pixmap to fit the label while maintaining aspect ratio
+        pixmap = pixmap.scaled(self.camera_label.width(), self.camera_label.height(), 
+                               Qt.AspectRatioMode.KeepAspectRatio)
+        
+        # Display the frame
+        self.camera_label.setPixmap(pixmap)
         
     def capture_image(self):
         if self.frame is not None:
@@ -317,8 +403,9 @@ class ImageAnalysisApp(QMainWindow):
         if not self.timer.isActive():
             self.timer.start(30)
         
-        # Clear the response_text field
-        self.response_text.clear()
+        # Clear the chat display and history
+        self.chat_display.clear()
+        self.chat_history = []
         
         # Update status label
         self.status_label.setText("Ready")
@@ -342,9 +429,16 @@ class ImageAnalysisApp(QMainWindow):
         self.status_label.setText("Analyzing image...")
         self.status_label.setStyleSheet("color: #2196F3; font-weight: bold;")
         
+        # Clear the chat history and display
+        self.chat_history = []
+        self.chat_display.clear()
+        
+        # Add a system message indicating analysis is starting
+        self.add_message_to_chat("System", "Analyzing image...")
+        
         # Run analysis in a separate thread to avoid UI freezing
         prompt = self.generate_prompt()
-        threading.Thread(target=self._run_analysis, args=(self.generate_prompt(),), daemon=True).start()
+        threading.Thread(target=self._run_analysis, args=(prompt,), daemon=True).start()
 
     def generate_prompt(self):
         # Get prompt
@@ -364,7 +458,15 @@ class ImageAnalysisApp(QMainWindow):
             client = OpenAI()
             image_path = self.curr_image
             base64_image = self.encode_image(image_path)
-            final_prompt = self.generate_prompt()
+            
+            # Add the initial prompt to chat history
+            self.chat_history.append({"role": "user", "content": [
+                { "type": "input_text", "text": f"Hello. {prompt}"},
+                {
+                    "type": "input_image",
+                    "image_url": f"data:image/jpeg;base64,{base64_image}",
+                },
+            ]})
 
             response = client.responses.create(
                 model="gpt-4o",
@@ -372,7 +474,7 @@ class ImageAnalysisApp(QMainWindow):
                     {
                         "role": "user",
                         "content": [
-                            { "type": "input_text", "text": f"Hello. {final_prompt}"},
+                            { "type": "input_text", "text": f"Hello. {prompt}"},
                             {
                                 "type": "input_image",
                                 "image_url": f"data:image/jpeg;base64,{base64_image}",
@@ -382,14 +484,17 @@ class ImageAnalysisApp(QMainWindow):
                 ],
             )
             response_text = response.output_text
+            
+            # Add to chat history
+            self.chat_history.append({"role": "assistant", "content": response_text})
+            
             # Append response to responses.txt
             timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
             with open("responses.txt", "a") as file:
                 file.write(f"\n {timestamp} - {response_text}\n \n \n")
 
             # Update UI in the main thread
-            QApplication.instance().postEvent(self, ResultEvent(response_text))
-
+            QApplication.instance().postEvent(self, ChatResponseEvent(response_text))
             
         except Exception as e:
             # Handle errors
@@ -398,21 +503,23 @@ class ImageAnalysisApp(QMainWindow):
             QApplication.instance().postEvent(self, ErrorEvent(error_message))
     
     def handle_result(self, result_text):
-        self.response_text.setText(result_text)
+        # Update the chat display
+        self.add_message_to_chat("AI", result_text)
         self.analyze_btn.setEnabled(True)
         self.save_btn.setEnabled(True)
         self.status_label.setText("Analysis complete!")
         self.status_label.setStyleSheet("color: #4CAF50; font-weight: bold;")
-    
+
     def handle_error(self, error_message):
-        self.response_text.setText(f"ERROR: {error_message}")
+        # Update the chat display
+        self.add_message_to_chat("System", f"ERROR: {error_message}")
         self.analyze_btn.setEnabled(True)
         self.status_label.setText("Analysis failed")
         self.status_label.setStyleSheet("color: #f44336; font-weight: bold;")
     
     def save_results(self):
-        if not self.response_text.toPlainText():
-            QMessageBox.warning(self, "No Results", "There are no results to save.")
+        if not self.chat_history:
+            QMessageBox.warning(self, "No Results", "There are no chat results to save.")
             return
             
         # Create a folder for results if it doesn't exist
@@ -428,11 +535,20 @@ class ImageAnalysisApp(QMainWindow):
             image_path = os.path.join(results_dir, f"image_{timestamp}.jpg")
             cv2.imwrite(image_path, self.captured_image)
             
-            # Save the analysis text
-            text_path = os.path.join(results_dir, f"analysis_{timestamp}.txt")
+            # Save the chat history text
+            text_path = os.path.join(results_dir, f"chat_{timestamp}.txt")
             with open(text_path, 'w') as f:
-                f.write(f" \n Prompt: {self.prompt_input.toPlainText()}\n\n")
-                f.write(f"Analysis:\n{self.response_text.toPlainText()}")
+                for msg in self.chat_history:
+                    if msg["role"] == "user":
+                        if isinstance(msg["content"], list):
+                            # This is the first message with image and prompt
+                            for content_item in msg["content"]:
+                                if content_item["type"] == "input_text":
+                                    f.write(f"User: {content_item['text']}\n\n")
+                        else:
+                            f.write(f"User: {msg['content']}\n\n")
+                    elif msg["role"] == "assistant":
+                        f.write(f"AI: {msg['content']}\n\n")
                 
             # Save a JSON file with all information
             json_path = os.path.join(results_dir, f"complete_{timestamp}.json")
@@ -441,60 +557,160 @@ class ImageAnalysisApp(QMainWindow):
             
             result_data = {
                 "timestamp": timestamp,
-                "prompt": self.prompt_input.toPlainText(),
-                "response": self.response_text.toPlainText(),
+                "chat_history": self.chat_history,
                 "image_path": image_path,
                 "image_base64": encoded_image
             }
             
             with open(json_path, 'w') as f:
                 json.dump(result_data, f, indent=2)
-                
+            
             QMessageBox.information(self, "Save Successful", 
-                                   f"Results saved to folder '{results_dir}':\n"
-                                   f"- Image: image_{timestamp}.jpg\n"
-                                   f"- Analysis: analysis_{timestamp}.txt\n"
-                                   f"- Complete data: complete_{timestamp}.json")
+                               f"Results saved to folder '{results_dir}':\n"
+                               f"- Image: image_{timestamp}.jpg\n"
+                               f"- Chat history: chat_{timestamp}.txt\n"
+                               f"- Complete data: complete_{timestamp}.json")
                                    
         except Exception as e:
             QMessageBox.critical(self, "Save Error", f"Failed to save results: {str(e)}")
-    
+            
     def closeEvent(self, event):
         # Clean up resources when window is closed
         if self.camera is not None and self.camera.isOpened():
             self.camera.release()
         event.accept()
-
-
-# Custom event for thread communication
-class ResultEvent(QEvent):
-    EVENT_TYPE = QEvent.Type(QEvent.registerEventType())
+        
+    # Override event method to handle custom events
+    def event(self, event):
+        if event.type() == ResultEvent.EVENT_TYPE:
+            self.handle_result(event.result_text)
+            return True
+        elif event.type() == ErrorEvent.EVENT_TYPE:
+            self.handle_error(event.error_message)
+            return True
+        elif event.type() == ChatResponseEvent.EVENT_TYPE:
+            self.handle_chat_response(event.response_text)
+            return True
+        return super().event(event)
     
-    def __init__(self, result_text):
-        super().__init__(self.EVENT_TYPE)
-        self.result_text = result_text
+    def eventFilter(self, obj, event):
+        if obj == self.message_input and event.type() == QEvent.Type.KeyPress:
+            if event.key() == Qt.Key.Key_Return and not event.modifiers() & Qt.KeyboardModifier.ShiftModifier:
+                self.send_message()
+                return True
+        return super().eventFilter(obj, event)
+
+    def send_message(self):
+        message = self.message_input.toPlainText().strip()
+        if not message:
+            return
+            
+        # Add user message to chat display
+        self.add_message_to_chat("You", message)
+        
+        # Clear the input field
+        self.message_input.clear()
+        
+        # Add to chat history
+        self.chat_history.append({"role": "user", "content": message})
+        
+        # Process the message if there's a captured image
+        if self.captured_image is not None:
+            self.status_label.setText("Processing your message...")
+            self.status_label.setStyleSheet("color: #2196F3; font-weight: bold;")
+            
+            # Process in a thread
+            threading.Thread(target=self._process_chat_message, args=(message,), daemon=True).start()
+        else:
+            self.add_message_to_chat("System", "Please capture an image first before chatting.")
+
+    def add_message_to_chat(self, sender, message):
+        # Format the message
+        cursor = self.chat_display.textCursor()
+        cursor.movePosition(cursor.MoveOperation.End)
+        
+        # Add sender with formatting
+        format = QTextCharFormat()
+        if sender == "You":
+            format.setForeground(Qt.GlobalColor.white)
+        elif sender == "AI":
+            format.setForeground(Qt.GlobalColor.green)
+        else:  # System
+            format.setForeground(Qt.GlobalColor.yellow)
+            
+        format.setFontWeight(QFont.Weight.Bold)
+        cursor.setCharFormat(format)
+        cursor.insertText(f"{sender}: ")
+        
+        # Add message
+        format = QTextCharFormat()
+        if sender == "You":
+            format.setForeground(Qt.GlobalColor.white)
+        elif sender == "AI":
+            format.setForeground(Qt.GlobalColor.lightGray)
+        else:  # System
+            format.setForeground(Qt.GlobalColor.yellow)
+            
+        cursor.setCharFormat(format)
+        cursor.insertText(f"{message}\n\n")
+        
+        # Scroll to the bottom
+        self.chat_display.setTextCursor(cursor)
+        self.chat_display.ensureCursorVisible()
+
+    def handle_chat_response(self, response_text):
+        self.add_message_to_chat("AI", response_text)
+        self.analyze_btn.setEnabled(True)
+        self.save_btn.setEnabled(True)
+        self.status_label.setText("Ready")
+        self.status_label.setStyleSheet("color: #4CAF50; font-weight: bold;")
+
+    def _process_chat_message(self, message):
+        try:
+            client = OpenAI()
+            image_path = self.curr_image
+            base64_image = self.encode_image(image_path)
+            
+            # For follow-up questions, prepare the entire conversation history
+            messages = []
+            for msg in self.chat_history[:-1]:  # Exclude the current message
+                if isinstance(msg.get("content"), list):
+                    # Skip complex messages with images to save tokens
+                    continue
+                messages.append(msg)
+            
+            # Add the current message with the image
+            response = client.responses.create(
+                model="gpt-4o",
+                input=[
+                    {
+                        "role": "user", 
+                        "content": [
+                            {"type": "input_text", "text": message},
+                            {
+                                "type": "input_image",
+                                "image_url": f"data:image/jpeg;base64,{base64_image}"
+                            }
+                        ]
+                    }
+                ] + messages
+            )
+            
+            response_text = response.output_text
+            
+            # Add to chat history
+            self.chat_history.append({"role": "assistant", "content": response_text})
+            
+            # Update UI in the main thread
+            QApplication.instance().postEvent(self, ChatResponseEvent(response_text))
+            
+        except Exception as e:
+            # Handle errors
+            error_message = f"Error: {str(e)}"
+            print(error_message)
+            QApplication.instance().postEvent(self, ErrorEvent(error_message))
 
 
-class ErrorEvent(QEvent):
-    EVENT_TYPE = QEvent.Type(QEvent.registerEventType())
-    
-    def __init__(self, error_message):
-        super().__init__(self.EVENT_TYPE)
-        self.error_message = error_message
-
-
-# Override event method to handle custom events
-def event(self, event):
-    if event.type() == ResultEvent.EVENT_TYPE:
-        self.handle_result(event.result_text)
-        return True
-    elif event.type() == ErrorEvent.EVENT_TYPE:
-        self.handle_error(event.error_message)
-        return True
-    return super(ImageAnalysisApp, self).event(event)
-
-# Add the event method to the ImageAnalysisApp class
-ImageAnalysisApp.event = event
 
 
 if __name__ == "__main__":
